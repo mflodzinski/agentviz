@@ -21,3 +21,13 @@ During implementation:
 - Show how to manually test the feature.
 - Run automated tests and report results.
 - Point out weaknesses, edge cases, and alternatives.
+
+Do not add code solely because it sounds production-grade.
+
+Every abstraction must solve either:
+- an assignment requirement,
+- a demonstrated security/reliability problem,
+- testability,
+- or a clearly documented extension point.
+
+If you think something is overengineering for this take-home, say so.
