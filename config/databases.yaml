@@ -1,0 +1,21 @@
+databases:
+  chinook:
+    backend: sqlite
+    path: data/chinook.db
+  sakila:
+    backend: sqlite
+    path: data/sakila.db
+  northwind:
+    backend: sqlite
+    path: data/northwind_small.sqlite
+
+query:
+  max_rows: 5000
+  timeout_seconds: 10
+
+llm:
+  provider: openai
+  model: gpt-5
+  visualization_model: gpt-5-nano
+  api_key_env: OPENAI_API_KEY
+  temperature: 0
