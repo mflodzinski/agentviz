@@ -554,6 +554,239 @@ llm:
     assert "Visualization:\n" in result.output
 
 
+def test_cli_ask_can_save_llm_inputs_and_outputs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "chinook.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE invoices (
+            InvoiceId INTEGER PRIMARY KEY,
+            BillingCountry TEXT NOT NULL,
+            Total REAL NOT NULL
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO invoices (InvoiceId, BillingCountry, Total) VALUES (?, ?, ?)",
+        [
+            (1, "USA", 10.0),
+            (2, "USA", 5.0),
+            (3, "Canada", 7.5),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    FakeCLIOpenAIClient.responses = [
+        {
+            "kind": "query",
+            "sql": (
+                "SELECT BillingCountry, SUM(Total) AS revenue "
+                "FROM invoices GROUP BY BillingCountry ORDER BY revenue DESC"
+            ),
+            "reasoning_summary": "Group invoice totals by billing country.",
+            "message": None,
+        },
+        {
+            "chart_type": "bar",
+            "title": "Revenue by country",
+            "x": "BillingCountry",
+            "y": ["revenue"],
+            "x_label": "Country",
+            "y_label": "Revenue",
+            "aggregation": None,
+            "sort": "descending",
+        },
+    ]
+    FakeCLIOpenAIClient.requests = []
+    FakeCLIOpenAIClient.init_calls = []
+    monkeypatch.setattr("agentviz.cli.OpenAIClient", FakeCLIOpenAIClient)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "ask",
+            "--user",
+            "alice",
+            "--db",
+            "chinook",
+            "--save-llm-io",
+            "Show revenue by country",
+        ],
+        env={
+            CONFIG_DIR_ENV_VAR: write_config(
+                tmp_path,
+                chinook_path=str(database_path),
+                llm_yaml="""
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+  api_key_env: AGENTVIZ_TEST_OPENAI_KEY
+  temperature: 0
+""",
+            ),
+            "AGENTVIZ_TEST_OPENAI_KEY": "test-key",
+        },
+    )
+
+    llm_io_paths = list(Path("runs").glob("*/llm_io.json"))
+    assert result.exit_code == 0
+    assert len(llm_io_paths) == 1
+    assert f"LLM IO:\n{llm_io_paths[0].as_posix()}" in result.output
+    trace = json.loads(llm_io_paths[0].read_text(encoding="utf-8"))
+    assert [call["agent"] for call in trace["calls"]] == [
+        "analysis",
+        "visualization",
+    ]
+    assert trace["calls"][0]["request"]["response_schema_name"] == "AnalysisPlan"
+    assert trace["calls"][0]["response_kind"] == "query"
+    assert trace["calls"][0]["response"]["content"]["sql"].startswith(
+        "SELECT BillingCountry"
+    )
+    assert trace["calls"][1]["request"]["response_schema_name"] == "ChartSpec"
+    assert trace["calls"][1]["response_kind"] is None
+    assert trace["calls"][1]["response"]["content"]["chart_type"] == "bar"
+    assert "test-key" not in llm_io_paths[0].read_text(encoding="utf-8")
+    assert "USA" not in llm_io_paths[0].read_text(encoding="utf-8")
+
+
+def test_cli_ask_prompts_for_clarification_and_logs_response_kind(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "chinook.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE invoices (
+            InvoiceId INTEGER PRIMARY KEY,
+            InvoiceDate TEXT NOT NULL,
+            Total REAL NOT NULL
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO invoices (InvoiceId, InvoiceDate, Total) VALUES (?, ?, ?)",
+        [(1, "2010-01-01", 10.0), (2, "2011-01-01", 20.0)],
+    )
+    connection.commit()
+    connection.close()
+
+    FakeCLIOpenAIClient.responses = [
+        {
+            "kind": "clarification",
+            "sql": None,
+            "reasoning_summary": None,
+            "message": "Which period should I use?",
+        },
+        {
+            "kind": "query",
+            "sql": (
+                "SELECT strftime('%Y', InvoiceDate) AS Year, "
+                "SUM(Total) AS Revenue "
+                "FROM invoices GROUP BY Year ORDER BY Year"
+            ),
+            "reasoning_summary": "Group invoice revenue by year.",
+            "message": None,
+        },
+        {
+            "chart_type": "bar",
+            "title": "Revenue by Year",
+            "x": "Year",
+            "y": ["Revenue"],
+            "x_label": "Year",
+            "y_label": "Revenue",
+            "aggregation": None,
+            "sort": "ascending",
+        }
+    ]
+    FakeCLIOpenAIClient.requests = []
+    FakeCLIOpenAIClient.init_calls = []
+    monkeypatch.setattr("agentviz.cli.OpenAIClient", FakeCLIOpenAIClient)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "ask",
+            "--user",
+            "alice",
+            "--db",
+            "chinook",
+            "--save-llm-io",
+            "Show revenue for the relevant period.",
+        ],
+        input="2010 through 2011\n",
+        env={
+            CONFIG_DIR_ENV_VAR: write_config(
+                tmp_path,
+                chinook_path=str(database_path),
+                llm_yaml="""
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+  api_key_env: AGENTVIZ_TEST_OPENAI_KEY
+  temperature: 0
+""",
+            ),
+            "AGENTVIZ_TEST_OPENAI_KEY": "test-key",
+        },
+    )
+
+    llm_io_paths = list(Path("runs").glob("*/llm_io.json"))
+    manifest_paths = list(Path("runs").glob("*/manifest.json"))
+    assert result.exit_code == 0
+    assert "Analysis needs clarification:" in result.output
+    assert "Which period should I use?" in result.output
+    assert "Your clarification:" in result.output
+    assert "Query for 'chinook' returned 2 rows" in result.output
+    assert "Visualization:" in result.output
+    assert len(llm_io_paths) == 1
+    trace = json.loads(llm_io_paths[0].read_text(encoding="utf-8"))
+    assert [call["agent"] for call in trace["calls"]] == [
+        "analysis",
+        "analysis",
+        "visualization",
+    ]
+    assert [call["response_kind"] for call in trace["calls"]] == [
+        "clarification",
+        "query",
+        None,
+    ]
+    assert trace["calls"][0]["response"]["content"]["kind"] == "clarification"
+    assert "User clarification answer:\n2010 through 2011" in (
+        trace["calls"][1]["request"]["user_prompt"]
+    )
+    assert len(manifest_paths) == 1
+    manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+    assert manifest["analysis_status"] == "completed"
+    assert "User clarification answer:\n2010 through 2011" in manifest["request"]
+
+
+def test_cli_ask_rejects_llm_io_output_without_save_flag(tmp_path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "ask",
+            "--user",
+            "alice",
+            "--db",
+            "chinook",
+            "--llm-io-output",
+            "llm_io.json",
+            "Show revenue by country",
+        ],
+        env={CONFIG_DIR_ENV_VAR: write_config(tmp_path)},
+    )
+
+    assert result.exit_code != 0
+    assert "--llm-io-output requires --save-llm-io" in result.output
+
+
 def test_cli_ask_can_use_weaker_visualization_model(
     tmp_path,
     monkeypatch,

@@ -93,6 +93,9 @@ def test_build_analysis_prompts_include_question_and_schema() -> None:
     user_prompt = build_analysis_user_prompt(request=request, schema=schema())
 
     assert "read-only SQLite SELECT" in system_prompt
+    assert "do not guess defaults" in system_prompt
+    assert "not internal SQL implementation choices" in system_prompt
+    assert "aggregate total per requested group" in system_prompt
     assert "Authorization, SQL validation, and execution" in system_prompt
     assert "Show total revenue by customer." in user_prompt
     assert "Authorized schema:" in user_prompt

@@ -28,7 +28,13 @@ from agentviz.config import (
 )
 from agentviz.database import DatabaseRegistry
 from agentviz.errors import AgentVizError, ConfigurationError, IdentityError
-from agentviz.llm import LLMClient, OpenAIClient
+from agentviz.llm import (
+    LLMClient,
+    LLMIORecorder,
+    OpenAIClient,
+    RecordingLLMClient,
+    write_llm_io_trace,
+)
 from agentviz.models import (
     AnalysisAgentStatus,
     AnalysisArtifact,
@@ -54,6 +60,7 @@ app = typer.Typer(
 
 RESULT_DISPLAY_ROW_LIMIT = 10
 RESULT_DISPLAY_CELL_LIMIT = 80
+MAX_INTERACTIVE_CLARIFICATIONS = 2
 
 
 def _version_callback(value: bool) -> None:
@@ -232,8 +239,31 @@ def ask(
             help="Print additional deterministic workflow status.",
         ),
     ] = False,
+    save_llm_io: Annotated[
+        bool,
+        typer.Option(
+            "--save-llm-io",
+            help=(
+                "Write readable LLM prompts, response schemas, and structured "
+                "outputs to runs/<run_id>/llm_io.json."
+            ),
+        ),
+    ] = False,
+    llm_io_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--llm-io-output",
+            help=(
+                "Where to write LLM input/output JSON. Requires "
+                "--save-llm-io."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run the complete analysis and visualization workflow."""
+
+    if llm_io_output is not None and not save_llm_io:
+        raise typer.BadParameter("--llm-io-output requires --save-llm-io")
 
     try:
         identity = resolve_user_identity(user)
@@ -245,12 +275,19 @@ def ask(
             registry=registry,
             query_settings=config.query,
         )
+        llm_io_recorder = LLMIORecorder() if save_llm_io else None
         analysis_llm_client = (
             _build_llm_client(config.llm) if config.llm is not None else None
         )
+        if analysis_llm_client is not None and llm_io_recorder is not None:
+            analysis_llm_client = RecordingLLMClient(
+                analysis_llm_client,
+                llm_io_recorder,
+            )
         visualization_llm_client = _build_visualization_llm_client(
             config.llm,
             analysis_llm_client=analysis_llm_client,
+            llm_io_recorder=llm_io_recorder,
         )
         orchestrator = ApplicationOrchestrator(
             schema_service=AuthorizedSchemaService(
@@ -272,15 +309,16 @@ def ask(
             ),
             renderer=ChartRenderer(),
         )
+        run_id = generate_run_id()
+        chart_output_path = output or default_chart_output_path(run_id)
         request = AnalysisRequest(
             user=identity,
             database=db,
             question=question,
             include_visualization=True,
         )
-        run_id = generate_run_id()
-        chart_output_path = output or default_chart_output_path(run_id)
-        result = orchestrator.run(
+        result, request = _run_with_interactive_clarifications(
+            orchestrator=orchestrator,
             request=request,
             chart_output_path=chart_output_path,
             run_id=run_id,
@@ -289,6 +327,14 @@ def ask(
             request=request,
             result=result,
             output_path=default_manifest_output_path(run_id),
+        )
+        written_llm_io_path = (
+            write_llm_io_trace(
+                llm_io_recorder,
+                llm_io_output or Path("runs") / run_id / "llm_io.json",
+            )
+            if llm_io_recorder is not None
+            else None
         )
     except (AgentVizError, ConfigurationError, IdentityError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -300,6 +346,64 @@ def ask(
         manifest_path=manifest_path,
         show_sql=show_sql,
         verbose=verbose,
+    )
+    if written_llm_io_path is not None:
+        typer.echo()
+        typer.echo("LLM IO:")
+        typer.echo(written_llm_io_path)
+
+
+def _run_with_interactive_clarifications(
+    *,
+    orchestrator: ApplicationOrchestrator,
+    request: AnalysisRequest,
+    chart_output_path: Path,
+    run_id: str,
+) -> tuple[ApplicationRunResult, AnalysisRequest]:
+    current_request = request
+    clarification_count = 0
+    while True:
+        result = orchestrator.run(
+            request=current_request,
+            chart_output_path=chart_output_path,
+            run_id=run_id,
+        )
+        if result.analysis.status != AnalysisAgentStatus.NEEDS_CLARIFICATION:
+            return result, current_request
+        if clarification_count >= MAX_INTERACTIVE_CLARIFICATIONS:
+            return result, current_request
+
+        typer.echo("Analysis needs clarification:")
+        typer.echo(result.analysis.message or "Please clarify the request.")
+        answer = typer.prompt("Your clarification").strip()
+        if not answer:
+            raise typer.BadParameter("clarification response must be non-empty")
+
+        current_request = current_request.model_copy(
+            update={
+                "question": _append_clarification_answer(
+                    question=current_request.question,
+                    clarification=result.analysis.message
+                    or "Please clarify the request.",
+                    answer=answer,
+                )
+            }
+        )
+        clarification_count += 1
+
+
+def _append_clarification_answer(
+    *,
+    question: str,
+    clarification: str,
+    answer: str,
+) -> str:
+    return "\n\n".join(
+        [
+            f"Original request:\n{question}",
+            f"Analysis agent clarification question:\n{clarification}",
+            f"User clarification answer:\n{answer}",
+        ]
     )
 
 
@@ -370,6 +474,7 @@ def _build_visualization_llm_client(
     settings: LLMSettings | None,
     *,
     analysis_llm_client: LLMClient | None,
+    llm_io_recorder: LLMIORecorder | None = None,
 ) -> LLMClient | None:
     if settings is None:
         return None
@@ -377,7 +482,10 @@ def _build_visualization_llm_client(
     visualization_settings = _visualization_llm_settings(settings)
     if visualization_settings == settings:
         return analysis_llm_client
-    return _build_llm_client(visualization_settings)
+    visualization_llm_client = _build_llm_client(visualization_settings)
+    if llm_io_recorder is not None:
+        return RecordingLLMClient(visualization_llm_client, llm_io_recorder)
+    return visualization_llm_client
 
 
 def _visualization_llm_settings(settings: LLMSettings) -> LLMSettings:
@@ -401,10 +509,10 @@ def _print_application_result(
     typer.echo()
     typer.echo("Analysis:")
     if result.analysis.status != AnalysisAgentStatus.COMPLETED:
+        typer.echo(f"Status: {result.analysis.status}")
         typer.echo(result.analysis.message or result.analysis.status)
         if verbose:
             typer.echo()
-            typer.echo(f"Status: {result.analysis.status}")
             typer.echo(f"Manifest: {manifest_path}")
         return
 
