@@ -1,6 +1,6 @@
 # AgentViz
 
-AgentViz is a take-home project for a secure, CLI-driven data analysis and
+AgentViz is a project for a secure, CLI-driven data analysis and
 visualization system.
 
 The intended final architecture has two AI agents:
